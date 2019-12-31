@@ -1,0 +1,39 @@
+; PROGRAMMED BY justyy, 2008
+; LOOKS LIKE A TV SCREEN, 8 COLOR BARS
+; 640 X 480
+; 56 BYTES.
+
+ORG 100H 
+ 
+START: 
+  MOV AX, 12H 
+  INT 10H 
+  MOV CX, 1 
+  MOV DX, 1 
+ 
+JUDGE: 
+  CMP CX, 640 
+  JL SAMELINE 
+  MOV CX, 1 ; new line
+  INC DX 
+  CMP DX, 480 
+  JG READKEY ; finish
+ 
+SAMELINE: 
+  MOV AX, CX 
+  DEC AX 
+  MOV BL, 80 
+  DIV BL 
+  INC AL 
+  MOV AH, 0CH 
+  INT 10H ; draw a pixel
+  INC CX 
+  JMP JUDGE 
+ 
+READKEY: 
+  MOV AH, 01H 
+  INT 21H 
+  MOV AX, 3H 
+  INT 10H 
+  MOV AH, 4CH 
+  INT 21H 

@@ -1,0 +1,39 @@
+
+## TODO
+
+ * http://www.abandonia.com/en/games/24752/Amazon.html
+ * https://dosgames.com/files/beast.zip
+ * https://dosgames.com/files/alleycat.zip
+ * https://dosgames.com/files/asciiinvaders.zip
+ * https://dosgames.com/files/jumpman.zip
+ * https://dosgames.com/files/spacewar.zip
+ * https://dosgames.com/files/sw.zip
+ * https://dosgames.com/files/av.zip
+ * https://dosgames.com/files/autobots.zip
+ * https://dosgames.com/files/crobots.zip
+ * https://dosgames.com/files/dungeon.zip
+ * https://dosgames.com/files/DOSBOX_LARN.ZIP
+ * https://dosgames.com/files/mahjng42.zip
+ * https://dosgames.com/files/p-robots.zip
+ * https://dosgames.com/files/pitfall.zip
+ * https://dosgames.com/files/race.zip
+ * https://dosgames.com/files/ranadin.zip
+ * https://dosgames.com/files/rogue.zip
+ * https://dosgames.com/files/samspade.zip
+ * https://dosgames.com/files/styx.zip
+ * https://dosgames.com/files/snova.zip
+ * https://dosgames.com/files/telen.zip
+ * https://dosgames.com/files/TransylvaniaPC.zip
+ * https://www.gog.com/game/ultima_4?pp=cb7a1d775e800fd1ee4049f7dca9e041eb9ba083
+ * https://dosgames.com/files/carmeneurope.zip
+ * https://dosgames.com/files/carmenusa.zip
+ * https://dosgames.com/files/willy.zip
+ * https://dosgames.com/files/wizcastl.zip
+ * https://dosgames.com/files/minizork.zip
+ * https://www.myabandonware.com/game/dr-sleeptite-and-the-nightmare-factory-3bj
+ * http://www.pc-tools.net/files/dos/freeware/dosutils.zip
+ * https://www.gnostice.com/nl_article.asp?id=225&t=The_Smallest_%E2%80%9CHello_World%E2%80%9D_Program%E2%80%A6_At_20_Bytes!
+ * http://pastraiser.com/cpu/i8088/i8088_opcodes.html
+ * http://xxeo.com/single-byte-or-small-x86-opcodes
+ * https://files.osdev.org/mirrors/geezer/osd/boot/index.htm#snippets
+ * http://spike.scu.edu.au/~barry/interrupts.html
