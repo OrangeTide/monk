@@ -23,7 +23,28 @@ struct cpu {
 	WORD ip;
 	WORD segs[8]; /* ES CS SS DS */
 	WORD regs[8]; /* AX    CX    DX    BX    SP    BP    SI    DI */
+	WORD flags;
+	enum segment_override {
+		OVERRIDE_NONE,
+		OVERRIDE_ES,
+		OVERRIDE_CS,
+	} segment_override;
+	struct {
+		void *p;
+		BYTE n;
+		BYTE modrm;
+	} pending; // Pending/temporary memory access (kept in host byte order)
 };
+
+/* Notes for segment overrides
+ * Register            Implied Segment
+ * SP                  SS
+ * BP                  SS
+ * BX                  DS
+ * DI                  DS, ES for String Operations
+ * BP + SI, DI         SS
+ * BX + SI, DI         DS
+ */
 
 /* define ENDIAN as index to the high byte */
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
@@ -72,12 +93,43 @@ struct cpu {
 #define MODRM_RM(b) ((BYTE)(b) & 0x07)
 #define MODRM_N(b) (((BYTE)(b) & 0x38) >> 3)
 
+#define FLAG_VALUE_CF (1)
+#define FLAG_VALUE_AF (16)
+#define FLAG_VALUE_ZF (64)
+#define FLAG_VALUE_SF (128)
+
+#define FLAG_CF (cpu.flags & FLAG_VALUE_CF) /* Carry Flag */
+#define FLAG_PF (cpu.flags & 4) /* Parity Flag */
+#define FLAG_AF (cpu.flags & FLAG_VALUE_AF) /* Aux Carry Flag */
+#define FLAG_ZF (cpu.flags & FLAG_VALUE_ZF) /* Zero Flag */
+#define FLAG_SF (cpu.flags & FLAG_VALUE_SF) /* Sign Flag */
+#define FLAG_TF (cpu.flags & 256) /* Trap Flag */
+#define FLAG_IF (cpu.flags & 512) /* Interrupt Enable */
+#define FLAG_DF (cpu.flags & 1024) /* Direction */
+#define FLAG_OF (cpu.flags & 2048) /* Overflow Flag */
+
 typedef size_t ADDR;
+
+#if 0 /// TODO: use this for readbyte()/writebyte() etc
+enum peripherial_address {
+	PERIPH_RAM0,	/* 0000:0000 to 9000:FFFF -- Main system RAM */
+	PERIPH_VIDEO,	/* A000:0000 to B000:FFFF -- Video card */
+	PERIPH_VBIOS,	/* C000:0000 to C000:7FFF -- Video BIOS */
+	PERIPH_SYSBIOS,	/* F000:0000 to F000:FFFF -- System BIOS */
+};
+#endif
 
 static BYTE sysmem[1 << 18]; /* 256K RAM */
 static BYTE *basemem = sysmem + 0x500; /* conventional RAM at 0050:0000 */
 static size_t topmem;
 static struct cpu cpu;
+
+/* sign extend 8-bits to 16-bits */
+static inline WORD
+signext(BYTE b)
+{
+	return (WORD)(int8_t)b;
+}
 
 static inline ADDR
 segofs_to_addr(WORD seg, WORD ofs)
@@ -112,6 +164,27 @@ readword(ADDR a)
 	return sysmem[a] | ((WORD)sysmem[a + 1] << 8);
 }
 
+static inline void
+writebyte(ADDR a, BYTE b)
+{
+	if (a >= topmem) {
+		cpu.errors++;
+		return;
+	}
+	sysmem[a] = b;
+}
+
+static inline void
+writeword(ADDR a, WORD w)
+{
+	if ((a | 1) >= topmem) {
+		cpu.errors++;
+		return;
+	}
+	sysmem[a] = w & 0xffu;
+	sysmem[a + 1] = (w & 0xff00u) >> 8;
+}
+
 /* read byte and increment IP */
 static BYTE
 fetchbyte(void)
@@ -142,37 +215,122 @@ fetchword(void)
 	return readword(a);
 }
 
-/* turns a ModRM into a pointer */
-static BYTE *
-modrm_byte(BYTE modrm)
+static void
+pushword(WORD w)
+{
+	ADDR a = segofs_to_addr(SS, SP);
+	SP -= 2;
+	writeword(a, w);
+}
+
+static WORD
+popword(void)
+{
+	ADDR a = segofs_to_addr(SS, SP);
+	SS += 2;
+	return readword(a);
+}
+
+static void
+modrm_begin(int w)
 {
 	ADDR a;
 
-	switch (MODRM_MOD(modrm)) {
+	cpu.pending.modrm = fetchbyte();
+	cpu.pending.n = MODRM_N(cpu.pending.modrm); // TODO: elminate this
+
+	switch (MODRM_MOD(cpu.pending.modrm)) {
 	case 0: // Disp is 0
 		a = 0;
 		break;
 	case 1: // Disp is 8-bit and sign extended
-		a = (WORD)(int8_t)fetchbyte();
+		a = signext(fetchbyte());
 		break;
 	case 2: // Disp is 16-bit
 		a = fetchword();
 		break;
 	case 3: // R/M is REG
-		return &REG8(MODRM_RM(modrm));
+		if (w)
+			cpu.pending.p = &REG16(MODRM_RM(cpu.pending.modrm));
+		else
+			cpu.pending.p = &REG8(MODRM_RM(cpu.pending.modrm));
+		return;
 	}
-	/* TODO: apply R/M
-	switch (MODRM_RM(modrm)) {
-	case 6:
-		if (MODRM_MOD(modrm) == 0) ... TODO
+
+	switch (MODRM_RM(cpu.pending.modrm)) {
+	case 0: // (BX) + (SI) + DISP
+		a += BX + SI;
+		break;
+	case 1: // (BX) + (DI) + DISP
+		a += BX + DI;
+		break;
+	case 2: // (BP) + (SI) + DISP
+		a += BP + SI;
+		break;
+	case 3: // (BP) + (DI) + DISP
+		a += BP;
+		break;
+	case 4: // (SI) + DISP
+		a += SI;
+		break;
+	case 5: // (DI) + DISP
+		a += DI;
+		break;
+	case 6: // (BP) + DISP or disp-high:disp-low
+		if (MODRM_MOD(cpu.pending.modrm) == 0)
+			a = fetchword();
+		else
+			a += BP;
+		break;
+	case 7: // (BX) + DISP
+		a += BX;
+		break;
 	}
-	*/
 
 	if (a >= topmem) {
 		cpu.errors++;
-		return &sysmem[0];
+		return;
 	}
-	return &sysmem[a];
+	// TODO: use DS or segment_override
+	cpu.pending.p = &sysmem[a];
+}
+
+static void
+modrm_end(void)
+{
+	// useful for debugging code
+}
+
+static BYTE
+modrm_readbyte(void)
+{
+	return *(BYTE*)cpu.pending.p;
+}
+
+static WORD
+modrm_readword(void)
+{
+	if (MODRM_MOD(cpu.pending.modrm) == 3) {
+		return *(WORD*)cpu.pending.p;
+	} else {
+		return readword((BYTE*)cpu.pending.p - sysmem);
+	}
+}
+
+static void
+modrm_writebyte(BYTE b)
+{
+	*(BYTE*)cpu.pending.p = b;
+}
+
+static void
+modrm_writeword(WORD w)
+{
+	if (MODRM_MOD(cpu.pending.modrm) == 3) {
+		*(WORD*)cpu.pending.p = w;
+	} else {
+		writeword((BYTE*)cpu.pending.p - sysmem, w);
+	}
 }
 
 static void
@@ -314,13 +472,572 @@ initiate_irq(BYTE irq)
 	}
 }
 
+static void
+unknown(BYTE a) {
+	fprintf(stderr, "Unknown opcode %02hhX\n", a);
+}
+
+static void
+unknown2(BYTE a, BYTE b) {
+	fprintf(stderr, "Unknown opcode %02hhX %02hhX\n", a, b);
+}
+
 int
 system_tick(int n)
 {
+	BYTE bt, wt; /* temp byte and temp word */
+
 	while (!cpu.done && !cpu.errors && n > 0) {
 		BYTE op = fetchop();
 
 		switch (op) {
+		// 00 /r      ADD eb,rb   2,mem=7    Add byte register into EA byte
+		case 0x00:
+			modrm_begin(0);
+			bt = modrm_readbyte();
+			modrm_writebyte(bt + REG8(cpu.pending.n));
+			modrm_end();
+			break;
+
+		// 01 /r      ADD ew,rw   2,mem=7    Add word register into EA word
+		case 0x01:
+			modrm_begin(1);
+			wt = modrm_readword();
+			modrm_writeword(wt + REG16(cpu.pending.n));
+			modrm_end();
+			break;
+
+		// 02 /r      ADD rb,eb   2,mem=7    Add EA byte into byte register
+		case 0x02:
+			modrm_begin(0);
+			bt = modrm_readbyte();
+			REG8(cpu.pending.n) = bt + REG8(cpu.pending.n);
+			modrm_end();
+			break;
+
+		// 03 /r      ADD rw,ew   2,mem=7    Add EA word into word register
+		case 0x03:
+			modrm_begin(1);
+			wt = modrm_readword();
+			REG16(cpu.pending.n) = wt + REG16(cpu.pending.n);
+			modrm_end();
+			break;
+
+		// 04 db      ADD AL,db   3          Add immediate byte into AL
+		case 0x04:
+			AL += fetchbyte();
+			break;
+
+		// 05 dw      ADD AX,dw   3          Add immediate word into AX
+		case 0x05:
+			AX += fetchword();
+			break;
+
+		// 06         PUSH ES      3         Push ES
+		case 0x06:
+			pushword(ES);
+			break;
+
+		// 07          POP ES           5,pm=20    Pop top of stack into ES
+		case 0x07:
+			ES = popword();
+			break;
+
+		// 08 /r      OR eb,rb       2,mem=7   Logical-OR byte register into EA byte
+		case 0x08:
+			modrm_begin(0);
+			bt = modrm_readbyte();
+			modrm_writebyte(bt | REG8(cpu.pending.n));
+			modrm_end();
+			break;
+
+		// 09 /r      OR ew,rw       2,mem=7   Logical-OR word register into EA word
+		case 0x09:
+			modrm_begin(1);
+			wt = modrm_readword();
+			modrm_writeword(wt | REG16(cpu.pending.n));
+			modrm_end();
+			break;
+
+		// 0A /r      OR rb,eb       2,mem=7   Logical-OR EA byte into byte register
+		case 0x0A:
+			modrm_begin(0);
+			bt = modrm_readbyte();
+			REG8(cpu.pending.n) = bt | REG8(cpu.pending.n);
+			modrm_end();
+			break;
+
+		// 0B /r      OR rw,ew       2,mem=7   Logical-OR EA word into word register
+		case 0x0B:
+			modrm_begin(1);
+			wt = modrm_readword();
+			REG16(cpu.pending.n) = wt | REG16(cpu.pending.n);
+			modrm_end();
+			break;
+
+		// 0C db      OR AL,db       3         Logical-OR immediate byte into AL
+		case 0x0C:
+			AL = AL | fetchbyte();
+			break;
+
+		// 0D dw      OR AX,dw       3         Logical-OR immediate word into AX
+		case 0x0D:
+			AX = AX | fetchword();
+			break;
+
+		// 0E         PUSH CS      3         Push CS
+		case 0x0E:
+			pushword(CS);
+			break;
+
+		// 10 /r      ADC eb,rb   2,mem=7    Add with carry byte register into EA byte
+		case 0x10:
+			modrm_begin(0);
+			bt = modrm_readbyte();
+			modrm_writebyte(bt + REG8(cpu.pending.n) + FLAG_CF);
+			modrm_end();
+			break;
+
+		// 11 /r      ADC ew,rw   2,mem=7    Add with carry word register into EA word
+		case 0x11:
+			modrm_begin(1);
+			wt = modrm_readword();
+			modrm_writeword(wt + REG16(cpu.pending.n) + FLAG_CF);
+			modrm_end();
+			break;
+
+		// 12 /r      ADC rb,eb   2,mem=7    Add with carry EA byte into byte register
+		case 0x12:
+			modrm_begin(0);
+			bt = modrm_readbyte();
+			REG8(cpu.pending.n) = bt + REG8(cpu.pending.n) + FLAG_CF;
+			modrm_end();
+			break;
+
+		// 13 /r      ADC rw,ew   2,mem=7    Add with carry EA word into word register
+		case 0x13:
+			modrm_begin(1);
+			wt = modrm_readword();
+			REG16(cpu.pending.n) = wt + REG16(cpu.pending.n) + FLAG_CF;
+			modrm_end();
+			break;
+
+		// 14 db      ADC AL,db   3          Add with carry immediate byte into AL
+		case 0x14:
+			AL += fetchbyte() + FLAG_CF;
+			break;
+
+		// 15 dw      ADC AX,dw   3          Add with carry immediate word into AX
+		case 0x15:
+			AX += fetchword() + FLAG_CF;
+			break;
+
+
+		// 16         PUSH SS      3         Push SS
+		case 0x16:
+			pushword(SS);
+			break;
+
+		// 17          POP SS           5,pm=20    Pop top of stack into SS
+		case 0x17:
+			SS = popword();
+			break;
+
+		// 18 /r       SBB eb,rb    2,mem=7   Subtract with borrow byte register from EA byte
+		case 0x18:
+			modrm_begin(0);
+			bt = modrm_readbyte();
+			modrm_writebyte(bt - (REG8(cpu.pending.n) + FLAG_CF));
+			modrm_end();
+			break;
+
+		// 19 /r       SBB ew,rw    2,mem=7   Subtract with borrow word register from EA word
+		case 0x19:
+			modrm_begin(1);
+			wt = modrm_readword();
+			modrm_writeword(wt - (REG16(cpu.pending.n) + FLAG_CF));
+			modrm_end();
+			break;
+
+		// 1A /r       SBB rb,eb    2,mem=7   Subtract with borrow EA byte from byte register
+		case 0x1A:
+			modrm_begin(0);
+			bt = modrm_readbyte();
+			REG8(cpu.pending.n) = bt - (REG8(cpu.pending.n) + FLAG_CF);
+			modrm_end();
+			break;
+
+		// 1B /r       SBB rw,ew    2,mem=7   Subtract with borrow EA word from word register
+		case 0x1B:
+			modrm_begin(1);
+			wt = modrm_readword();
+			REG16(cpu.pending.n) = wt - (REG16(cpu.pending.n) - FLAG_CF);
+			modrm_end();
+			break;
+
+		// 1C db       SBB AL,db    3         Subtract with borrow imm.  byte from AL
+		case 0x1C:
+			AL -= fetchbyte() + FLAG_CF;
+			break;
+
+		// 1D dw       SBB AX,dw    3         Subtract with borrow imm.  word from AX
+		case 0x1D:
+			AX -= fetchword() + FLAG_CF;
+			break;
+
+		// 1E         PUSH DS      3         Push DS
+		case 0x1E:
+			pushword(DS);
+			break;
+
+		// 1F          POP DS           5,pm=20    Pop top of stack into DS
+		case 0x1F:
+			DS = popword();
+			break;
+
+		// 20 /r      AND eb,rb     2,mem=7    Logical-AND byte register into EA byte
+		case 0x20:
+			modrm_begin(0);
+			bt = modrm_readbyte();
+			modrm_writebyte(bt & REG8(cpu.pending.n));
+			modrm_end();
+			break;
+
+		// 21 /r      AND ew,rw     2,mem=7    Logical-AND word register into EA word
+		case 0x21:
+			modrm_begin(1);
+			wt = modrm_readword();
+			modrm_writeword(wt & REG16(cpu.pending.n));
+			modrm_end();
+			break;
+
+		// 22 /r      AND rb,eb     2,mem=7    Logical-AND EA byte into byte register
+		case 0x22:
+			modrm_begin(0);
+			bt = modrm_readbyte();
+			REG8(cpu.pending.n) = bt & REG8(cpu.pending.n);
+			modrm_end();
+			break;
+
+		// 23 /r      AND rw,ew     2,mem=7    Logical-AND EA word into word register
+		case 0x23:
+			modrm_begin(1);
+			wt = modrm_readword();
+			REG16(cpu.pending.n) = wt & REG16(cpu.pending.n);
+			modrm_end();
+			break;
+
+		// 24 db      AND AL,db     3          Logical-AND immediate byte into AL
+		case 0x24:
+			AL = AL & fetchbyte();
+			break;
+
+		// 25 dw      AND AX,dw     3          Logical-AND immediate word into AX
+		case 0x25:
+			AX = AX & fetchword();
+			break;
+
+		case 0x26:
+			cpu.segment_override = OVERRIDE_ES;
+			break;
+
+		// 27      DAA            3         Decimal adjust AL after addition
+		case 0x27:
+			if (FLAG_AF || (AL & 15) > 9) {
+				AL += 6;
+				cpu.flags |= FLAG_VALUE_AF;
+				// TODO: update CF
+				if (FLAG_CF || AL > 0x9F) {
+					AL += 0x60;
+					cpu.flags |= FLAG_VALUE_CF;
+				} else {
+					// Reset AF
+					cpu.flags &= ~FLAG_VALUE_AF;
+				}
+			} else {
+				// Reset AF
+				cpu.flags &= ~FLAG_VALUE_AF;
+			}
+			break;
+
+		// 28 /r      SUB eb,rb      2,mem=7     Subtract byte register from EA byte
+		case 0x28:
+			modrm_begin(0);
+			bt = modrm_readbyte();
+			modrm_writebyte(bt - REG8(cpu.pending.n));
+			modrm_end();
+			break;
+
+		// 29 /r      SUB ew,rw      2,mem=7     Subtract word register from EA word
+		case 0x29:
+			modrm_begin(1);
+			wt = modrm_readword();
+			modrm_writeword(wt - REG16(cpu.pending.n));
+			modrm_end();
+			break;
+
+		// 2A /r      SUB rb,eb      2,mem=7     Subtract EA byte from byte register
+		case 0x2A:
+			modrm_begin(0);
+			bt = modrm_readbyte();
+			REG8(cpu.pending.n) = bt - REG8(cpu.pending.n);
+			modrm_end();
+			break;
+
+		// 2B /r      SUB rw,ew      2,mem=7     Subtract EA word from word register
+		case 0x2B:
+			modrm_begin(1);
+			wt = modrm_readword();
+			REG16(cpu.pending.n) = wt - REG16(cpu.pending.n);
+			modrm_end();
+			break;
+
+		// 2C db      SUB AL,db      3           Subtract immediate byte from AL
+		case 0x2C:
+			AL -= fetchbyte();
+			break;
+
+		// 2D dw      SUB AX,dw      3           Subtract immediate word from AX
+		case 0x2D:
+			AX -= fetchword();
+			break;
+
+		case 0x2E:
+			cpu.segment_override = OVERRIDE_CS;
+			break;
+
+		// 2F        DAS             3          Decimal adjust AL after subtraction
+		case 0x2F:
+			if (FLAG_AF || (AL & 15) > 9) {
+				AL -= 6;
+				cpu.flags |= FLAG_VALUE_AF;
+				// TODO: update CF
+				if (FLAG_CF || AL > 0x9F) {
+					AL -= 0x60;
+					cpu.flags |= FLAG_VALUE_CF;
+				} else {
+					// Reset AF
+					cpu.flags &= ~FLAG_VALUE_AF;
+				}
+			} else {
+				// Reset AF
+				cpu.flags &= ~FLAG_VALUE_AF;
+			}
+			break;
+
+		// 30 /r     XOR eb,rb   2,mem=7   Exclusive-OR byte register into EA byte
+		case 0x30:
+			modrm_begin(0);
+			bt = modrm_readbyte();
+			modrm_writebyte(bt ^ REG8(cpu.pending.n));
+			modrm_end();
+			break;
+
+		// 31 /r     XOR ew,rw   2,mem=7   Exclusive-OR word register into EA word
+		case 0x31:
+			modrm_begin(1);
+			wt = modrm_readword();
+			modrm_writeword(wt ^ REG16(cpu.pending.n));
+			modrm_end();
+			break;
+
+		// 32 /r     XOR rb,eb   2,mem=7   Exclusive-OR EA byte into byte register
+		case 0x32:
+			modrm_begin(0);
+			bt = modrm_readbyte();
+			REG8(cpu.pending.n) = bt ^ REG8(cpu.pending.n);
+			modrm_end();
+			break;
+
+		// 33 /r     XOR rw,ew   2,mem=7   Exclusive-OR EA word into word register
+		case 0x33:
+			modrm_begin(1);
+			wt = modrm_readword();
+			REG16(cpu.pending.n) = wt ^ REG16(cpu.pending.n);
+			modrm_end();
+			break;
+
+		// 34 db     XOR AL,db   3         Exclusive-OR immediate byte into AL
+		case 0x34:
+			AL = AL ^ fetchbyte();
+			break;
+
+		// 35 dw     XOR AX,dw   3         Exclusive-OR immediate word into AX
+		case 0x35:
+			AX = AX ^ fetchword();
+			break;
+
+		// 50+ rw     PUSH rw      3         Push word register
+		case 0x50: case 0x51: case 0x52: case 0x53:
+		case 0x55: case 0x56: case 0x57:
+			pushword(REG16(op - 0x50));
+			break;
+		case 0x54: // PUSH SP
+#if 1
+			/* behavior on 8088/8086 */
+			pushword(SP - 2);
+#else
+			/* behavior on 286+ */
+			pushword(SP);
+#endif
+			break;
+
+		// 58+rw       POP rw           5          Pop top of stack into word register
+		case 0x58: case 0x59: case 0x5A: case 0x5B:
+		case 0x5C: case 0x5D: case 0x5E: case 0x5F:
+			REG16(op - 0x58) = popword();
+			break;
+
+		// 68  dw     PUSH dw      3         Push immediate word
+		case 0x68:
+			pushword(fetchword());
+			break;
+
+		// 6A  db     PUSH db      3         Push immediate sign-extended byte
+		case 0x6A:
+			pushword(signext(fetchbyte()));
+			break;
+
+		// 70  cb     JO cb      7,noj=3   Jump short if overflow (OF=1)
+		case 0x70: {
+			int a = signext(fetchbyte());
+			if (FLAG_OF)
+				IP += a;
+			break;
+		}
+
+		// 71  cb     JNO cb     7,noj=3   Jump short if notoverflow (OF=0)
+		case 0x71: {
+			int a = signext(fetchbyte());
+			if (!FLAG_PF)
+				IP += a;
+			break;
+		}
+
+		// 72  cb     JB cb      7,noj=3   Jump short if below (CF=1)
+		// 72  cb     JC cb      7,noj=3   Jump short if carry (CF=1)
+		case 0x72: {
+			int a = signext(fetchbyte());
+			if (FLAG_CF)
+				IP += a;
+			break;
+		}
+
+		// 73  cb     JNB cb     7,noj=3   Jump short if not below (CF=0)
+		// 73  cb     JNC cb     7,noj=3   Jump short if not carry (CF=0)
+		case 0x73: {
+			int a = signext(fetchbyte());
+			if (!FLAG_CF)
+				IP += a;
+			break;
+		}
+
+		// 74  cb     JE cb      7,noj=3   Jump short if equal (ZF=1)
+		// 74  cb     JZ cb      7,noj=3   Jump short if zero (ZF=1)
+		case 0x74: {
+			int a = signext(fetchbyte());
+			if (FLAG_ZF)
+				IP += a;
+			break;
+		}
+
+		// 75  cb     JNE cb     7,noj=3   Jump short if not equal (ZF=0)
+		// 75  cb     JNZ cb     7,noj=3   Jump short if not zero (ZF=0)
+		case 0x75: {
+			int a = signext(fetchbyte());
+			if (!FLAG_ZF)
+				IP += a;
+			break;
+		}
+
+		// 76  cb     JBE cb     7,noj=3   Jump short if below or equal (CF=1 or ZF=1)
+		// 76  cb     JNA cb     7,noj=3   Jump short if not above (CF=1 or ZF=1)
+		case 0x76: {
+			int a = signext(fetchbyte());
+			if (FLAG_CF | FLAG_ZF)
+				IP += a;
+			break;
+		}
+
+		// 77  cb     JA cb      7,noj=3   Jump short if above (CF=0 and ZF=0)
+		// 77  cb     JNBE cb    7,noj=3   Jump short if not below/equal (CF=0 and ZF=0)
+		case 0x77: {
+			int a = signext(fetchbyte());
+			if (FLAG_CF & FLAG_ZF)
+				IP += a;
+			break;
+		}
+
+		// 78  cb     JS cb      7,noj=3   Jump short if sign (SF=1)
+		case 0x78: {
+			int a = signext(fetchbyte());
+			if (FLAG_SF)
+				IP += a;
+			break;
+		}
+
+		// 79  cb     JNS cb     7,noj=3   Jump short if not sign (SF=0)
+		case 0x79: {
+			int a = signext(fetchbyte());
+			if (!FLAG_SF)
+				IP += a;
+			break;
+		}
+
+		// 7A  cb     JP cb      7,noj=3   Jump short if parity (PF=1)
+		// 7A  cb     JPE cb     7,noj=3   Jump short if parity even (PF=1)
+		case 0x7A: {
+			int a = signext(fetchbyte());
+			if (FLAG_PF)
+				IP += a;
+			break;
+		}
+
+		// 7B  cb     JPO cb     7,noj=3   Jump short if parity odd (PF=0)
+		// 7B  cb     JNP cb     7,noj=3   Jump short if not parity (PF=0)
+		case 0x7B: {
+			int a = signext(fetchbyte());
+			if (!FLAG_PF)
+				IP += a;
+			break;
+		}
+
+		// 7C  cb     JL cb      7,noj=3   Jump short if less (SF/=OF)
+		// 7C  cb     JNGE cb    7,noj=3   Jump short if not greater/equal (SF/=OF)
+		case 0x7C: {
+			int a = signext(fetchbyte());
+			if (!FLAG_SF != !FLAG_OF)
+				IP += a;
+			break;
+		}
+
+		// 7D  cb     JGE cb     7,noj=3   Jump short if greater or equal (SF=OF)
+		// 7D  cb     JNL cb     7,noj=3   Jump short if not less (SF=OF)
+		case 0x7D: {
+			int a = signext(fetchbyte());
+			if (!FLAG_SF == !FLAG_OF)
+				IP += a;
+			break;
+		}
+
+		// 7E  cb     JLE cb     7,noj=3   Jump short if less or equal (ZF=1 or SF/=OF)
+		// 7E  cb     JNG cb     7,noj=3   Jump short if not greater (ZF=1 or SF/=OF)
+		case 0x7E: {
+			int a = signext(fetchbyte());
+			if (FLAG_ZF || (!FLAG_SF != !FLAG_OF))
+				IP += a;
+			break;
+		}
+
+		// 7F  cb     JG cb      7,noj=3   Jump short if greater (ZF=0 and SF=OF)
+		// 7F  cb     JNLE cb    7,noj=3   Jump short if not less/equal (ZF=0 and SF=OF)
+		case 0x7F: {
+			int a = signext(fetchbyte());
+			if (!FLAG_ZF && (!FLAG_SF == !FLAG_OF))
+				IP += a;
+			break;
+		}
+
 		// B0+ rb db  MOV rb,db   2             Move immediate byte into byte register
 		case 0xB0: case 0xB1: case 0xB2: case 0xB3:
 		case 0xB4: case 0xB5: case 0xB6: case 0xB7:
@@ -340,43 +1057,72 @@ system_tick(int n)
 			break;
 
 		case 0XE2: { /* LOOP cb */
-			WORD disp = (DWORD)(int8_t)fetchbyte();
+			WORD disp = signext(fetchbyte());
 			CX--;
 			if (CX != 0)
 				IP += disp;
 			break;
 		}
 
-		case 0xFE: { /* misc eb */
-			BYTE *eb;
-			WORD *ew;
-			BYTE modrm = fetchbyte();
-
-			switch (MODRM_N(modrm)) {
+		case 0xFE: /* misc eb */
+			modrm_begin(0);
+			switch (cpu.pending.n) {
 			case 0: /* INC eb */
-				eb = modrm_byte(modrm);
-				(*eb)++;
+				bt = modrm_readbyte();
+				modrm_writebyte(bt + 1);
 				// TODO: what side-effects?
-				fprintf(stderr, "[%02hhX %02hhX] INC eb {mod=%d,n=%d,rm=%d}\n", op, modrm,
-					MODRM_MOD(modrm), MODRM_N(modrm), MODRM_RM(modrm));
 				break;
 			case 1: /* DEC eb */
-				eb = modrm_byte(modrm);
-				(*eb)--;
+				bt = modrm_readbyte();
+				modrm_writebyte(bt - 1);
 				// TODO: what side-effects?
-				fprintf(stderr, "[%02hhX %02hhX] DEC eb\n", op, modrm);
 				break;
 			default:
 				cpu.errors++;
-				fprintf(stderr, "Unknown opcode %02hhX %02hhX\n", op, modrm);
+				unknown2(op, cpu.pending.modrm);
 				goto out;
 			}
+			modrm_end();
+
+		case 0xFF: { /* misc eb */
+			modrm_begin(1);
+			switch (cpu.pending.n) {
+			case 0: /* INC ew */
+				wt = modrm_readword();
+				modrm_writebyte(wt + 1);
+				// TODO: what side-effects?
+				break;
+			case 1: /* DEC ew */
+				wt = modrm_readword();
+				modrm_writebyte(wt - 1);
+				// TODO: what side-effects?
+				break;
+			case 2: /* CALL r/m16 */
+			case 3: /* CALL m32 */
+			case 4: /* JMP r/m16 */
+			case 5: /* JMP m32 */
+				// TODO: implement this
+				cpu.errors++;
+				unknown2(op, cpu.pending.modrm);
+				goto out;
+			case 6: /* PUSH r/m16 */
+				pushword(modrm_readword());
+				break;
+			case 7: /* invalid ... */
+			default:
+				cpu.errors++;
+				unknown2(op, cpu.pending.modrm);
+				goto out;
+			}
+			modrm_end();
 			break;
+
 		}
 
+		case 0x0F: /* undefined on 8086/8088 */
 		default:
 			cpu.errors++;
-			fprintf(stderr, "Unknown opcode %02hhX\n", op);
+			unknown(op);
 			goto out;
 		}
 		n--;
