@@ -18,11 +18,13 @@ main(int argc, char *argv[])
 
 	if (argc == 1) {
 		result = system_loadfile("hello.com");
-	} else if (argc == 2) {
-		result = system_loadfile(argv[1]);
 	} else {
-		fprintf(stderr, "usage: %s [yourfile.com]\n", argv[0]);
-		return -1;
+		if (argv[1][0] == '-') { /* treat any flags as an error */
+			fprintf(stderr, "usage: %s [yourfile.com]\n", argv[0]);
+			return -1;
+		}
+		result = system_loadfile(argv[1]);
+		system_setargs(argc - 2, argv + 2);
 	}
 
 	if (result) {

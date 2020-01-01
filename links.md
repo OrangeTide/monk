@@ -37,3 +37,4 @@
  * http://xxeo.com/single-byte-or-small-x86-opcodes
  * https://files.osdev.org/mirrors/geezer/osd/boot/index.htm#snippets
  * http://spike.scu.edu.au/~barry/interrupts.html
+ * http://helppc.netcore2k.net/table/psp

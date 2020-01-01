@@ -9,5 +9,6 @@ typedef uint32_t DWORD;
 int system_init(void);
 void system_done(void);
 int system_loadfile(const char *filename);
+int system_setargs(int argc, char *argv[]);
 int system_tick(int n);
 #endif

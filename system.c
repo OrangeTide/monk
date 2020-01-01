@@ -28,6 +28,8 @@ struct cpu {
 		OVERRIDE_NONE,
 		OVERRIDE_ES,
 		OVERRIDE_CS,
+		OVERRIDE_SS,
+		OVERRIDE_DS,
 	} segment_override;
 	struct {
 		void *p;
@@ -36,15 +38,16 @@ struct cpu {
 	} pending; // Pending/temporary memory access (kept in host byte order)
 };
 
-/* Notes for segment overrides
- * Register            Implied Segment
- * SP                  SS
- * BP                  SS
- * BX                  DS
- * DI                  DS, ES for String Operations
- * BP + SI, DI         SS
- * BX + SI, DI         DS
- */
+static const BYTE implied_seg[8] = {
+	[0] = 3, // (BX) + (SI) + DISP
+	[1] = 3, // (BX) + (DI) + DISP
+	[2] = 2, // (BP) + (SI) + DISP
+	[3] = 2, // (BP) + (DI) + DISP
+	[4] = 3, // (SI) + DISP
+	[5] = 0, // (DI) + DISP  ... might be DS or ES
+	[6] = 2, // (BP) + DISP or disp-high:disp-low
+	[7] = 3, // (BX) + DISP
+};
 
 /* define ENDIAN as index to the high byte */
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
@@ -287,11 +290,29 @@ modrm_begin(int w)
 		break;
 	}
 
+	switch (cpu.segment_override) {
+	case OVERRIDE_NONE:
+		a = segofs_to_addr(cpu.segs[implied_seg[MODRM_RM(cpu.pending.modrm)]], a);
+		break;
+	case OVERRIDE_ES:
+		a = segofs_to_addr(ES, a);
+		break;
+	case OVERRIDE_CS:
+		a = segofs_to_addr(CS, a);
+		break;
+	case OVERRIDE_SS:
+		a = segofs_to_addr(SS, a);
+		break;
+	case OVERRIDE_DS:
+		a = segofs_to_addr(DS, a);
+		break;
+	}
+
 	if (a >= topmem) {
 		cpu.errors++;
 		return;
 	}
-	// TODO: use DS or segment_override
+
 	cpu.pending.p = &sysmem[a];
 }
 
@@ -405,6 +426,46 @@ system_loadfile(const char *filename)
 	return 0;
 }
 
+int
+system_setargs(int argc, char *argv[])
+{
+	WORD psp_seg;
+	ADDR a;
+	int i, j;
+	size_t total_len;
+
+	// TODO: check for .COM vs .EXE
+	psp_seg = (ADDR)(basemem - sysmem) >> 4;
+
+	/* length of command line arguments */
+	a = segofs_to_addr(psp_seg, 0x80);
+	fprintf(stderr, "Command-line at @ %06hX\n", a);
+
+	a++;
+	for (i = 0, total_len = 0; i < argc; i++) {
+		const char *s = argv[i];
+
+		for (j = 0; s[j]; j++) {
+			if (total_len < 126) {
+				writebyte(a + total_len, s[j]);
+				total_len++;
+			}
+		}
+		if (total_len < 126 && i + 1 != argc) {
+			writebyte(a + total_len, ' ');
+			total_len++;
+		}
+	}
+	if (total_len < 127) {
+		writebyte(a + total_len, '\r');
+		total_len++;
+	}
+
+	writebyte(a - 1, total_len);
+
+	return 0; // TODO: return error on overflow
+}
+
 static void
 print_cpu(const char *prefix)
 {
@@ -424,6 +485,8 @@ print_cpu(const char *prefix)
 static void
 console_out(BYTE b)
 {
+	if (b == '\r')
+		return;
 	fputc(b, stdout);
 }
 
@@ -446,6 +509,27 @@ dosirq(void)
 			}
 			fprintf(stdout, "\"\n");
 			AL = '$';
+			break;
+		}
+		case 0x40: { /* Write file handle */
+			if (BX == 1) { /* stdout */
+				BYTE b;
+				WORD i;
+				ADDR m;
+
+				fprintf(stdout, "Console: \"");
+				for (i = 0; i < CX; i++) {
+					m = segofs_to_addr(DS, DX + i);
+					b = readbyte(m);
+					console_out(b);
+					m++;
+				}
+				fprintf(stdout, "\"\n");
+				AX = i;
+			} else { /* error - handle not found or not value for writing */
+				cpu.flags |= FLAG_VALUE_CF;
+				AX = 0x05; // TODO: use the right error code here
+			}
 			break;
 		}
 		default:
@@ -489,6 +573,9 @@ system_tick(int n)
 
 	while (!cpu.done && !cpu.errors && n > 0) {
 		BYTE op = fetchop();
+
+		/* reset some state at the start of each instruction */
+		cpu.segment_override = OVERRIDE_NONE;
 
 		switch (op) {
 		// 00 /r      ADD eb,rb   2,mem=7    Add byte register into EA byte
@@ -1037,6 +1124,70 @@ system_tick(int n)
 				IP += a;
 			break;
 		}
+
+		// 86 /r     XCHG eb,rb     3,mem=5     Exchange byte register with EA byte
+		// 86 /r     XCHG rb,eb     3,mem=5     Exchange EA byte with byte register
+		// 87 /r     XCHG ew,rw     3,mem=5     Exchange word register with EA word
+		// 87 /r     XCHG rw,ew     3,mem=5     Exchange EA word with word register
+		case 0x86:
+		case 0x87:
+			cpu.errors++;
+			unknown(op); // TODO: implement this
+			goto out;
+			break;
+
+		// 88 /r      MOV eb,rb   2,mem=3       Move byte register into EA byte
+		case 0x88:
+			modrm_begin(0);
+			modrm_writebyte(REG8(cpu.pending.n));
+			modrm_end();
+			break;
+
+		// 89 /r      MOV ew,rw   2,mem=3       Move word register into EA word
+		case 0x89:
+			modrm_begin(0);
+			wt = modrm_readword();
+			REG16(cpu.pending.n) = wt;
+			modrm_end();
+			break;
+
+		// 8A /r      MOV rb,eb   2,mem=5       Move EA byte into byte register
+		case 0x8A:
+			modrm_begin(0);
+			bt = modrm_readbyte();
+			REG8(cpu.pending.n) = bt;
+			modrm_end();
+			break;
+
+		// 8B /r      MOV rw,ew   2,mem=5       Move EA word into word register
+		case 0x8B:
+			modrm_begin(0);
+			modrm_writeword(REG16(cpu.pending.n));
+			modrm_end();
+			break;
+
+		case 0x8C: /* 8C MOV ew, ES/CS/SS/DS */
+		// 8C /0      MOV ew,ES   2,mem=3       Move ES into EA word
+		// 8C /1      MOV ew,CS   2,mem=3       Move CS into EA word
+		// 8C /2      MOV ew,SS   2,mem=3       Move SS into EA word
+		// 8C /3      MOV ew,DS   2,mem=3       Move DS into EA word
+			cpu.errors++;
+			unknown(op); // TODO: implement this
+			goto out;
+			break;
+
+		case 0x8E: /* 8E MOV ES/SS/DS, mw/rw */
+		// 8E /0      MOV ES,mw   5,pm=19       Move memory word into ES
+		// 8E /0      MOV ES,rw   2,pm=17       Move word register into ES
+		// 8E /2      MOV SS,mw   5,pm=19       Move memory word into SS
+		// 8E /2      MOV SS,rw   2,pm=17       Move word register into SS
+		// 8E /3      MOV DS,mw   5,pm=19       Move memory word into DS
+		// 8E /3      MOV DS,rw   2,pm=17       Move word register into DS
+			cpu.errors++;
+			unknown(op); // TODO: implement this
+			goto out;
+			break;
+
 
 		// B0+ rb db  MOV rb,db   2             Move immediate byte into byte register
 		case 0xB0: case 0xB1: case 0xB2: case 0xB3:
